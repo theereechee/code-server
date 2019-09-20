@@ -7,9 +7,9 @@ jobs:
   build:
     strategy:
        matrix:
-         platform: [ubuntu-latest, macos-latest]
+         os: ['ubuntu-latest', 'macos-latest']
          linux-platforms: ['linux', 'alpine']
-    runs-on: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@master
 
@@ -28,7 +28,7 @@ jobs:
            PACKAGE: 'true'
 
       - name: Build code-server binary (macOS)
-        if: contains( ${{ matrix.platform }} , 'macos-latest')
+        if: contains( ${{ strategy.matrix.os }} , 'macos-latest')
         run: bash ./scripts/ci.bash    
         env:
            MAJOR_VERSION: '2'
