@@ -30,7 +30,7 @@ jobs:
            PACKAGE: 'true'
 
       - name: Build code-server binary (macOS)
-        if: contains(${PLATFORM}, 'macos-latest')
+        if: ${{ matrix.platform }} == "macos"
         run: bash ./scripts/ci.bash    
         env:
            PLATFORM: ${{ matrix.platform }}
