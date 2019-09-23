@@ -30,7 +30,7 @@ jobs:
            PACKAGE: 'true'
 
       - name: Build code-server binary (macOS)
-        if: ${{ matrix.platform }} == "macos"
+        if: ${PLATFORM} == "macos"
         run: bash ./scripts/ci.bash    
         env:
            PLATFORM: ${{ matrix.platform }}
