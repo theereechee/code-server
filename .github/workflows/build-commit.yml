@@ -21,6 +21,7 @@ jobs:
       - name: Build code-server binary (Linux)
         run: bash ./scripts/ci.bash    
         env:
+           PLATFORM: ${{ matrix.platform }}
            MAJOR_VERSION: '2'
            TARGET: ${{ matrix.linux-platforms }}
            VERSION: '${MAJOR_VERSION}.${GITHUB_SHA}'
@@ -29,11 +30,17 @@ jobs:
            PACKAGE: 'true'
 
       - name: Build code-server binary (macOS)
-        if: contains(${{ matrix.platform }}, 'macos-latest')
+        if: contains(${PLATFORM}, 'macos-latest')
         run: bash ./scripts/ci.bash    
         env:
+           PLATFORM: ${{ matrix.platform }}
            MAJOR_VERSION: '2'
            VERSION: '${MAJOR_VERSION}.${GITHUB_SHA}'
            VSCODE_VERSION: '1.38.1'
            MINIFY: 'true' 
            PACKAGE: 'true'
+
+      - uses: actions/upload-artifact@master
+        with:
+          name: nightly-builds
+          path: build/
