@@ -1,149 +1,132 @@
-import * as cp from "child_process";
-import * as os from "os";
-import * as path from "path";
-import { Stream } from "stream";
-import * as util from "util";
-import { toVSBufferReadableStream } from "vs/base/common/buffer";
-import { CancellationToken } from "vs/base/common/cancellation";
-import { URI } from "vs/base/common/uri";
-import * as pfs from "vs/base/node/pfs";
-import { IConfigurationService } from "vs/platform/configuration/common/configuration";
-import { IEnvironmentService } from "vs/platform/environment/common/environment";
-import { IFileService } from "vs/platform/files/common/files";
-import { ILogService } from "vs/platform/log/common/log";
-import pkg from "vs/platform/product/node/package";
-import { asJson, IRequestService } from "vs/platform/request/common/request";
-import { AvailableForDownload, State, StateType, UpdateType } from "vs/platform/update/common/update";
-import { AbstractUpdateService } from "vs/platform/update/electron-main/abstractUpdateService";
-import { ipcMain } from "vs/server/src/node/ipc";
-import { extract } from "vs/server/src/node/marketplace";
-import { tmpdir } from "vs/server/src/node/util";
-import * as zlib from "zlib";
+import { field, logger } from "@coder/logger"
+import * as http from "http"
+import * as https from "https"
+import * as semver from "semver"
+import * as url from "url"
+import { version } from "./constants"
+import { settings as globalSettings, SettingsProvider, UpdateSettings } from "./settings"
 
-interface IUpdate {
-	name: string;
+export interface Update {
+  checked: number
+  version: string
 }
 
-export class UpdateService extends AbstractUpdateService {
-	_serviceBrand: any;
+export interface LatestResponse {
+  name: string
+}
 
-	constructor(
-		@IConfigurationService configurationService: IConfigurationService,
-		@IEnvironmentService environmentService: IEnvironmentService,
-		@IRequestService requestService: IRequestService,
-		@ILogService logService: ILogService,
-		@IFileService private readonly fileService: IFileService,
-	) {
-		super(null, configurationService, environmentService, requestService, logService);
-	}
+/**
+ * Provide update information.
+ */
+export class UpdateProvider {
+  private update?: Promise<Update>
+  private updateInterval = 1000 * 60 * 60 * 24 // Milliseconds between update checks.
 
-	public async isLatestVersion(latest?: IUpdate | null): Promise<boolean | undefined> {
-		if (!latest) {
-			latest = await this.getLatestVersion();
-		}
-		if (latest) {
-			const latestMajor = parseInt(latest.name);
-			const currentMajor = parseInt(pkg.codeServerVersion);
-			return !isNaN(latestMajor) && !isNaN(currentMajor) &&
-				currentMajor <= latestMajor && latest.name === pkg.codeServerVersion;
-		}
-		return true;
-	}
+  public constructor(
+    /**
+     * The URL for getting the latest version of code-server. Should return JSON
+     * that fulfills `LatestResponse`.
+     */
+    private readonly latestUrl = "https://api.github.com/repos/cdr/code-server/releases/latest",
+    /**
+     * Update information will be stored here. If not provided, the global
+     * settings will be used.
+     */
+    private readonly settings: SettingsProvider<UpdateSettings> = globalSettings,
+  ) {}
 
-	protected buildUpdateFeedUrl(): string {
-		return "https://api.github.com/repos/cdr/code-server/releases/latest";
-	}
+  /**
+   * Query for and return the latest update.
+   */
+  public async getUpdate(force?: boolean): Promise<Update> {
+    // Don't run multiple requests at a time.
+    if (!this.update) {
+      this.update = this._getUpdate(force)
+      this.update.then(() => (this.update = undefined))
+    }
 
-	protected doQuitAndInstall(): void {
-		ipcMain.relaunch();
-	}
+    return this.update
+  }
 
-	protected async doCheckForUpdates(context: any): Promise<void> {
-		if (this.state.type !== StateType.Idle) {
-			return Promise.resolve();
-		}
-		this.setState(State.CheckingForUpdates(context));
-		try {
-			const update = await this.getLatestVersion();
-			if (!update || this.isLatestVersion(update)) {
-				this.setState(State.Idle(UpdateType.Archive));
-			} else {
-				this.setState(State.AvailableForDownload({
-					version: update.name,
-					productVersion: update.name,
-				}));
-			}
-		} catch (error) {
-			this.onRequestError(error, !!context);
-		}
-	}
+  private async _getUpdate(force?: boolean): Promise<Update> {
+    const now = Date.now()
+    try {
+      let { update } = !force ? await this.settings.read() : { update: undefined }
+      if (!update || update.checked + this.updateInterval < now) {
+        const buffer = await this.request(this.latestUrl)
+        const data = JSON.parse(buffer.toString()) as LatestResponse
+        update = { checked: now, version: data.name.replace(/^v/, "") }
+        await this.settings.write({ update })
+      }
+      logger.debug("got latest version", field("latest", update.version))
+      return update
+    } catch (error) {
+      logger.error("Failed to get latest version", field("error", error.message))
+      return {
+        checked: now,
+        version: "unknown",
+      }
+    }
+  }
 
-	private async getLatestVersion(): Promise<IUpdate | null> {
-		const data = await this.requestService.request({
-			url: this.url,
-			headers: {
-				"User-Agent": "code-server",
-			},
-		}, CancellationToken.None);
-		return asJson(data);
-	}
+  /**
+   * Return true if the currently installed version is the latest.
+   */
+  public isLatestVersion(latest: Update): boolean {
+    logger.debug("comparing versions", field("current", version), field("latest", latest.version))
+    try {
+      return semver.lte(latest.version, version)
+    } catch (error) {
+      return true
+    }
+  }
 
-	protected async doDownloadUpdate(state: AvailableForDownload): Promise<void> {
-		this.setState(State.Updating(state.update));
-		const target = os.platform();
-		const releaseName = await this.buildReleaseName(state.update.version);
-		const url = "https://github.com/cdr/code-server/releases/download/"
-			+ `${state.update.version}/${releaseName}`
-			+ `.${target === "darwin" ? "zip" : "tar.gz"}`;
-		const downloadPath = path.join(tmpdir, `${state.update.version}-archive`);
-		const extractPath = path.join(tmpdir, state.update.version);
-		try {
-			await pfs.mkdirp(tmpdir);
-			const context = await this.requestService.request({ url }, CancellationToken.None);
-			// Decompress the gzip as we download. If the gzip encoding is set then
-			// the request service already does this.
-			// HACK: This uses knowledge of the internals of the request service.
-			if (target !== "darwin" && context.res.headers["content-encoding"] !== "gzip") {
-				const stream = (context.res as any as Stream);
-				stream.removeAllListeners();
-				context.stream = toVSBufferReadableStream(stream.pipe(zlib.createGunzip()));
-			}
-			await this.fileService.writeFile(URI.file(downloadPath), context.stream);
-			await extract(downloadPath, extractPath, undefined, CancellationToken.None);
-			const newBinary = path.join(extractPath, releaseName, "code-server");
-			if (!pfs.exists(newBinary)) {
-				throw new Error("No code-server binary in extracted archive");
-			}
-			await pfs.unlink(process.argv[0]); // Must unlink first to avoid ETXTBSY.
-			await pfs.move(newBinary, process.argv[0]);
-			this.setState(State.Ready(state.update));
-		} catch (error) {
-			this.onRequestError(error, true);
-		}
-		await Promise.all([downloadPath, extractPath].map((p) => pfs.rimraf(p)));
-	}
+  private async request(uri: string): Promise<Buffer> {
+    const response = await this.requestResponse(uri)
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = []
+      let bufferLength = 0
+      response.on("data", (chunk) => {
+        bufferLength += chunk.length
+        chunks.push(chunk)
+      })
+      response.on("error", reject)
+      response.on("end", () => {
+        resolve(Buffer.concat(chunks, bufferLength))
+      })
+    })
+  }
 
-	private onRequestError(error: Error, showNotification?: boolean): void {
-		this.logService.error(error);
-		const message: string | undefined = showNotification ? (error.message || error.toString()) : undefined;
-		this.setState(State.Idle(UpdateType.Archive, message));
-	}
+  private async requestResponse(uri: string): Promise<http.IncomingMessage> {
+    let redirects = 0
+    const maxRedirects = 10
+    return new Promise((resolve, reject) => {
+      const request = (uri: string): void => {
+        logger.debug("Making request", field("uri", uri))
+        const httpx = uri.startsWith("https") ? https : http
+        const client = httpx.get(uri, { headers: { "User-Agent": "code-server" } }, (response) => {
+          if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 400) {
+            response.destroy()
+            return reject(new Error(`${uri}: ${response.statusCode || "500"}`))
+          }
 
-	private async buildReleaseName(release: string): Promise<string> {
-		let target: string = os.platform();
-		if (target === "linux") {
-			const result = await util.promisify(cp.exec)("ldd --version").catch((error) => ({
-				stderr: error.message,
-				stdout: "",
-			}));
-			if (result.stderr.indexOf("musl") !== -1 || result.stdout.indexOf("musl") !== -1) {
-				target = "alpine";
-			}
-		}
-		let arch = os.arch();
-		if (arch === "x64") {
-			arch = "x86_64";
-		}
-		return `code-server${release}-${target}-${arch}`;
-	}
+          if (response.statusCode >= 300) {
+            response.destroy()
+            ++redirects
+            if (redirects > maxRedirects) {
+              return reject(new Error("reached max redirects"))
+            }
+            if (!response.headers.location) {
+              return reject(new Error("received redirect with no location header"))
+            }
+            return request(url.resolve(uri, response.headers.location))
+          }
+
+          resolve(response)
+        })
+        client.on("error", reject)
+      }
+      request(uri)
+    })
+  }
 }
